@@ -591,6 +591,8 @@ Middleware _cors() {
 
 void main() async {
   final router = Router()
+    ..get('/',       (_) => _json(200, {'status': 'ok', 'service': 'OlysTech API'}))
+    ..get('/health', (_) => _json(200, {'status': 'ok'}))
     // ── Auth
     ..post('/register',        _register)
     ..post('/login',           _login)
