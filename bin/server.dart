@@ -18,6 +18,7 @@ Future<void> _initDb() async {
   final uri      = Uri.parse(rawUrl);
   final userParts = uri.userInfo.split(':');
 
+  final isPublic = uri.host.contains('railway.app') || uri.host.contains('proxy');
   _db = await Connection.open(
     Endpoint(
       host: uri.host,
@@ -26,7 +27,9 @@ Future<void> _initDb() async {
       username: userParts.isNotEmpty ? userParts[0] : null,
       password: userParts.length > 1 ? userParts[1] : null,
     ),
-    settings: ConnectionSettings(sslMode: SslMode.require),
+    settings: ConnectionSettings(
+      sslMode: isPublic ? SslMode.require : SslMode.disable,
+    ),
   );
 
   await _db.execute('''
