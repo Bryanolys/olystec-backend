@@ -5,90 +5,149 @@ import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart';
 import 'package:shelf_router/shelf_router.dart';
 import 'package:crypto/crypto.dart';
+import 'package:postgres/postgres.dart';
 
-// ── JSON file "database" ──────────────────────────────────────────────────────
-// Persiste cada tabela num arquivo data/<table>.json.
-// Não requer nenhuma instalação externa — funciona em qualquer máquina.
+// ── Database ──────────────────────────────────────────────────────────────────
 
-class _Db {
-  final String _dir;
+late Connection _db;
 
-  _Db(this._dir) {
-    Directory(_dir).createSync(recursive: true);
-  }
+Future<void> _initDb() async {
+  final url = Platform.environment['DATABASE_URL'];
+  if (url == null) throw Exception('DATABASE_URL não definido');
 
-  List<Map<String, dynamic>> _read(String table) {
-    final f = File('$_dir/$table.json');
-    if (!f.existsSync()) return [];
-    try {
-      return (jsonDecode(f.readAsStringSync()) as List)
-          .cast<Map<String, dynamic>>();
-    } catch (_) {
-      return [];
-    }
-  }
+  _db = await Connection.open(
+    Endpoint.parse(url),
+    settings: ConnectionSettings(sslMode: SslMode.require),
+  );
 
-  void _save(String table, List<Map<String, dynamic>> rows) =>
-      File('$_dir/$table.json')
-          .writeAsStringSync(const JsonEncoder.withIndent('  ').convert(rows));
+  await _db.execute('''
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      phone TEXT,
+      avatar_url TEXT,
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ
+    )
+  ''');
 
-  List<Map<String, dynamic>> find(String table,
-      {bool Function(Map<String, dynamic>)? where}) {
-    final rows = _read(table);
-    return where == null ? rows : rows.where(where).toList();
-  }
+  await _db.execute('''
+    CREATE TABLE IF NOT EXISTS sessions (
+      id SERIAL PRIMARY KEY,
+      user_id INT NOT NULL,
+      email TEXT NOT NULL,
+      ip TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  ''');
 
-  Map<String, dynamic>? findOne(String table,
-      {required bool Function(Map<String, dynamic>) where}) =>
-      find(table, where: where).firstOrNull;
+  await _db.execute('''
+    CREATE TABLE IF NOT EXISTS reset_tokens (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      code TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  ''');
 
-  Map<String, dynamic> insert(String table, Map<String, dynamic> data) {
-    final rows = _read(table);
-    final nextId = rows.isEmpty
-        ? 1
-        : rows
-                .map((r) => (r['id'] as num?)?.toInt() ?? 0)
-                .reduce((a, b) => a > b ? a : b) +
-            1;
-    final row = {
-      'id': nextId,
-      'created_at': DateTime.now().toUtc().toIso8601String(),
-      ...data,
-    };
-    rows.add(row);
-    _save(table, rows);
-    return row;
-  }
+  await _db.execute('''
+    CREATE TABLE IF NOT EXISTS favorites (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      product_id TEXT NOT NULL,
+      product_name TEXT,
+      price DOUBLE PRECISION,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(email, product_id)
+    )
+  ''');
 
-  bool update(String table, Map<String, dynamic> patch,
-      {required bool Function(Map<String, dynamic>) where}) {
-    final rows = _read(table);
-    var changed = false;
-    for (var i = 0; i < rows.length; i++) {
-      if (where(rows[i])) {
-        rows[i] = {
-          ...rows[i],
-          ...patch,
-          'updated_at': DateTime.now().toUtc().toIso8601String(),
-        };
-        changed = true;
-      }
-    }
-    if (changed) _save(table, rows);
-    return changed;
-  }
+  await _db.execute('''
+    CREATE TABLE IF NOT EXISTS price_alerts (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      product_id TEXT NOT NULL,
+      product_name TEXT,
+      current_price DOUBLE PRECISION,
+      target_price DOUBLE PRECISION NOT NULL,
+      active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  ''');
 
-  int delete(String table,
-      {required bool Function(Map<String, dynamic>) where}) {
-    final rows = _read(table);
-    final before = rows.length;
-    rows.removeWhere(where);
-    if (rows.length != before) _save(table, rows);
-    return before - rows.length;
-  }
+  await _db.execute('''
+    CREATE TABLE IF NOT EXISTS orders (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      total DOUBLE PRECISION NOT NULL,
+      status TEXT DEFAULT 'pending',
+      address_id INT,
+      payment_method TEXT DEFAULT 'credit_card',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ
+    )
+  ''');
+
+  await _db.execute('''
+    CREATE TABLE IF NOT EXISTS order_items (
+      id SERIAL PRIMARY KEY,
+      order_id INT NOT NULL,
+      product_id TEXT NOT NULL,
+      product_name TEXT,
+      store TEXT,
+      price DOUBLE PRECISION NOT NULL,
+      quantity INT DEFAULT 1,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  ''');
+
+  await _db.execute('''
+    CREATE TABLE IF NOT EXISTS addresses (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      label TEXT DEFAULT 'Casa',
+      recipient TEXT,
+      street TEXT,
+      number TEXT,
+      complement TEXT,
+      neighborhood TEXT,
+      city TEXT,
+      state TEXT,
+      zip_code TEXT,
+      is_default BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ
+    )
+  ''');
+
+  await _db.execute('''
+    CREATE TABLE IF NOT EXISTS reviews (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      product_id TEXT NOT NULL,
+      rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+      comment TEXT DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE(email, product_id)
+    )
+  ''');
+
+  await _db.execute('''
+    CREATE TABLE IF NOT EXISTS notifications (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL,
+      type TEXT,
+      title TEXT,
+      body TEXT,
+      read BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  ''');
 }
-
-final _db = _Db('data');
 
 // ── Utilidades ────────────────────────────────────────────────────────────────
 
@@ -111,15 +170,28 @@ Future<Map<String, dynamic>?> _parseBody(Request req) async {
   }
 }
 
+Map<String, dynamic> _rowToMap(ResultRow row) {
+  final map = <String, dynamic>{};
+  for (final col in row.schema.columns) {
+    final val = row[col.columnName];
+    if (val is DateTime) {
+      map[col.columnName!] = val.toUtc().toIso8601String();
+    } else {
+      map[col.columnName!] = val;
+    }
+  }
+  return map;
+}
+
 // ── Auth: /register ───────────────────────────────────────────────────────────
 
 Future<Response> _register(Request req) async {
   final b = await _parseBody(req);
   if (b == null) return _json(400, {'message': 'JSON inválido'});
 
-  final name  = (b['name']     as String?)?.trim();
-  final email = (b['email']    as String?)?.trim().toLowerCase();
-  final pass  = b['password']  as String?;
+  final name  = (b['name']    as String?)?.trim();
+  final email = (b['email']   as String?)?.trim().toLowerCase();
+  final pass  = b['password'] as String?;
 
   if ([name, email, pass].any((v) => v == null || v!.isEmpty)) {
     return _json(400, {'message': 'Preencha todos os campos'});
@@ -127,29 +199,40 @@ Future<Response> _register(Request req) async {
   if (!email!.contains('@')) {
     return _json(400, {'message': 'Informe um e-mail válido'});
   }
-  if (_db.findOne('users', where: (r) => r['email'] == email) != null) {
-    return _json(409, {'message': 'Este e-mail já está cadastrado'});
+
+  try {
+    final exists = await _db.execute(
+      Sql.named('SELECT id FROM users WHERE email = @email'),
+      parameters: {'email': email},
+    );
+    if (exists.isNotEmpty) {
+      return _json(409, {'message': 'Este e-mail já está cadastrado'});
+    }
+
+    await _db.execute(
+      Sql.named(
+          'INSERT INTO users (name, email, password_hash) VALUES (@name, @email, @hash)'),
+      parameters: {'name': name, 'email': email, 'hash': _hash(pass!)},
+    );
+
+    await _db.execute(
+      Sql.named('''INSERT INTO notifications (email, type, title, body)
+          VALUES (@email, @type, @title, @body)'''),
+      parameters: {
+        'email': email,
+        'type': 'welcome',
+        'title': 'Bem-vindo à OlysTech! 🎉',
+        'body': 'Sua conta foi criada com sucesso. Explore as melhores ofertas!',
+      },
+    );
+
+    return _json(201, {
+      'message': 'Cadastro realizado com sucesso',
+      'user': {'name': name, 'email': email},
+    });
+  } catch (e) {
+    return _json(500, {'message': 'Erro interno: $e'});
   }
-
-  _db.insert('users', {
-    'name': name,
-    'email': email,
-    'password_hash': _hash(pass!),
-    'active': true,
-  });
-
-  _db.insert('notifications', {
-    'email': email,
-    'type': 'welcome',
-    'title': 'Bem-vindo à OlysTech! 🎉',
-    'body': 'Sua conta foi criada com sucesso. Explore as melhores ofertas!',
-    'read': false,
-  });
-
-  return _json(201, {
-    'message': 'Cadastro realizado com sucesso',
-    'user': {'name': name, 'email': email},
-  });
 }
 
 // ── Auth: /login ──────────────────────────────────────────────────────────────
@@ -158,28 +241,39 @@ Future<Response> _login(Request req) async {
   final b = await _parseBody(req);
   if (b == null) return _json(400, {'message': 'JSON inválido'});
 
-  final email = (b['email']    as String?)?.trim().toLowerCase();
-  final pass  = b['password']  as String?;
+  final email = (b['email']   as String?)?.trim().toLowerCase();
+  final pass  = b['password'] as String?;
 
   if ([email, pass].any((v) => v == null || v!.isEmpty)) {
     return _json(400, {'message': 'Preencha todos os campos'});
   }
 
-  final user = _db.findOne('users',
-      where: (r) => r['email'] == email && r['password_hash'] == _hash(pass!));
-  if (user == null) {
-    return _json(401, {'message': 'E-mail ou senha incorretos'});
+  try {
+    final rows = await _db.execute(
+      Sql.named('SELECT * FROM users WHERE email = @email AND password_hash = @hash AND active = TRUE'),
+      parameters: {'email': email, 'hash': _hash(pass!)},
+    );
+
+    if (rows.isEmpty) {
+      return _json(401, {'message': 'E-mail ou senha incorretos'});
+    }
+
+    final user = _rowToMap(rows.first);
+    await _db.execute(
+      Sql.named('INSERT INTO sessions (user_id, email, ip) VALUES (@uid, @email, @ip)'),
+      parameters: {
+        'uid': user['id'],
+        'email': email,
+        'ip': req.headers['x-forwarded-for'] ?? 'local',
+      },
+    );
+
+    return _json(200, {
+      'user': {'name': user['name'], 'email': user['email']},
+    });
+  } catch (e) {
+    return _json(500, {'message': 'Erro interno: $e'});
   }
-
-  _db.insert('sessions', {
-    'user_id': user['id'],
-    'email': email,
-    'ip': req.headers['x-forwarded-for'] ?? 'local',
-  });
-
-  return _json(200, {
-    'user': {'name': user['name'], 'email': user['email']},
-  });
 }
 
 // ── Auth: /forgot-password ────────────────────────────────────────────────────
@@ -193,28 +287,28 @@ Future<Response> _forgotPassword(Request req) async {
     return _json(400, {'message': 'Informe um e-mail válido.'});
   }
 
-  if (_db.findOne('users', where: (r) => r['email'] == email) == null) {
-    return _json(200, {
-      'message': 'Se este e-mail estiver cadastrado, você receberá o código.'
-    });
+  final exists = await _db.execute(
+    Sql.named('SELECT id FROM users WHERE email = @email'),
+    parameters: {'email': email},
+  );
+  if (exists.isEmpty) {
+    return _json(200, {'message': 'Se este e-mail estiver cadastrado, você receberá o código.'});
   }
 
   final code      = _otp();
   final expiresAt = DateTime.now().toUtc().add(const Duration(minutes: 15));
 
-  _db.delete('reset_tokens', where: (r) => r['email'] == email);
-  _db.insert('reset_tokens', {
-    'email': email,
-    'code': code,
-    'expires_at': expiresAt.toIso8601String(),
-  });
+  await _db.execute(
+    Sql.named('DELETE FROM reset_tokens WHERE email = @email'),
+    parameters: {'email': email},
+  );
+  await _db.execute(
+    Sql.named('INSERT INTO reset_tokens (email, code, expires_at) VALUES (@email, @code, @exp)'),
+    parameters: {'email': email, 'code': code, 'exp': expiresAt},
+  );
 
-  stderr.writeln('[DEV] Código para $email: $code (válido 15 min)');
-
-  return _json(200, {
-    'message': 'Código enviado.',
-    'dev_code': code,
-  });
+  stderr.writeln('[DEV] Código para $email: $code');
+  return _json(200, {'message': 'Código enviado.', 'dev_code': code});
 }
 
 // ── Auth: /verify-code ────────────────────────────────────────────────────────
@@ -225,19 +319,23 @@ Future<Response> _verifyCode(Request req) async {
 
   final email = (b['email'] as String?)?.trim().toLowerCase();
   final code  = (b['code']  as String?)?.trim();
-
   if (email == null || code == null || code.length != 6) {
     return _json(400, {'message': 'Dados inválidos.'});
   }
 
-  final token = _db.findOne('reset_tokens',
-      where: (r) => r['email'] == email && r['code'] == code);
-  if (token == null) {
-    return _json(400, {'message': 'Código inválido ou expirado.'});
-  }
+  final rows = await _db.execute(
+    Sql.named('SELECT * FROM reset_tokens WHERE email = @email AND code = @code'),
+    parameters: {'email': email, 'code': code},
+  );
+  if (rows.isEmpty) return _json(400, {'message': 'Código inválido ou expirado.'});
 
-  if (DateTime.now().toUtc().isAfter(DateTime.parse(token['expires_at'] as String))) {
-    _db.delete('reset_tokens', where: (r) => r['email'] == email);
+  final token = _rowToMap(rows.first);
+  final exp   = DateTime.parse(token['expires_at'] as String);
+  if (DateTime.now().toUtc().isAfter(exp)) {
+    await _db.execute(
+      Sql.named('DELETE FROM reset_tokens WHERE email = @email'),
+      parameters: {'email': email},
+    );
     return _json(400, {'message': 'Código expirado. Solicite um novo.'});
   }
 
@@ -250,74 +348,129 @@ Future<Response> _resetPassword(Request req) async {
   final b = await _parseBody(req);
   if (b == null) return _json(400, {'message': 'JSON inválido'});
 
-  final email = (b['email']    as String?)?.trim().toLowerCase();
-  final code  = (b['code']     as String?)?.trim();
-  final pass  = b['password']  as String?;
+  final email = (b['email']   as String?)?.trim().toLowerCase();
+  final code  = (b['code']    as String?)?.trim();
+  final pass  = b['password'] as String?;
 
   if (email == null || code == null || code.length != 6 ||
       pass == null || pass.length < 6) {
     return _json(400, {'message': 'Dados inválidos.'});
   }
 
-  final token = _db.findOne('reset_tokens',
-      where: (r) => r['email'] == email && r['code'] == code);
-  if (token == null) {
-    return _json(400, {'message': 'Código inválido ou expirado.'});
-  }
-  if (DateTime.now().toUtc().isAfter(DateTime.parse(token['expires_at'] as String))) {
-    _db.delete('reset_tokens', where: (r) => r['email'] == email);
-    return _json(400, {'message': 'Código expirado. Solicite um novo.'});
+  final rows = await _db.execute(
+    Sql.named('SELECT * FROM reset_tokens WHERE email = @email AND code = @code'),
+    parameters: {'email': email, 'code': code},
+  );
+  if (rows.isEmpty) return _json(400, {'message': 'Código inválido ou expirado.'});
+
+  final token = _rowToMap(rows.first);
+  final exp   = DateTime.parse(token['expires_at'] as String);
+  if (DateTime.now().toUtc().isAfter(exp)) {
+    await _db.execute(
+      Sql.named('DELETE FROM reset_tokens WHERE email = @email'),
+      parameters: {'email': email},
+    );
+    return _json(400, {'message': 'Código expirado.'});
   }
 
-  _db.update('users', {'password_hash': _hash(pass)},
-      where: (r) => r['email'] == email);
-  _db.delete('reset_tokens', where: (r) => r['email'] == email);
+  await _db.execute(
+    Sql.named('UPDATE users SET password_hash = @hash, updated_at = NOW() WHERE email = @email'),
+    parameters: {'hash': _hash(pass), 'email': email},
+  );
+  await _db.execute(
+    Sql.named('DELETE FROM reset_tokens WHERE email = @email'),
+    parameters: {'email': email},
+  );
 
   return _json(200, {'message': 'Senha redefinida com sucesso.'});
+}
+
+// ── Perfil ────────────────────────────────────────────────────────────────────
+
+Future<Response> _getProfile(Request req) async {
+  final email = req.url.queryParameters['email'];
+  if (email == null || email.isEmpty) return _json(400, {'message': 'E-mail obrigatório'});
+
+  final rows = await _db.execute(
+    Sql.named('SELECT id, name, email, phone, avatar_url, created_at FROM users WHERE email = @email'),
+    parameters: {'email': email},
+  );
+  if (rows.isEmpty) return _json(404, {'message': 'Usuário não encontrado'});
+
+  return _json(200, {'user': _rowToMap(rows.first)});
+}
+
+Future<Response> _updateProfile(Request req) async {
+  final b = await _parseBody(req);
+  if (b == null) return _json(400, {'message': 'JSON inválido'});
+  final email = (b['email'] as String?)?.trim().toLowerCase();
+  if (email == null || email.isEmpty) return _json(400, {'message': 'E-mail obrigatório'});
+
+  if (b['name'] != null) {
+    await _db.execute(
+      Sql.named('UPDATE users SET name = @name, updated_at = NOW() WHERE email = @email'),
+      parameters: {'name': (b['name'] as String).trim(), 'email': email},
+    );
+  }
+  if (b['phone'] != null) {
+    await _db.execute(
+      Sql.named('UPDATE users SET phone = @phone, updated_at = NOW() WHERE email = @email'),
+      parameters: {'phone': b['phone'], 'email': email},
+    );
+  }
+  if (b['avatar_url'] != null) {
+    await _db.execute(
+      Sql.named('UPDATE users SET avatar_url = @url, updated_at = NOW() WHERE email = @email'),
+      parameters: {'url': b['avatar_url'], 'email': email},
+    );
+  }
+
+  return _json(200, {'message': 'Perfil atualizado'});
 }
 
 // ── Favoritos ─────────────────────────────────────────────────────────────────
 
 Future<Response> _getFavorites(Request req) async {
   final email = req.url.queryParameters['email'];
-  if (email == null || email.isEmpty) {
-    return _json(400, {'message': 'E-mail obrigatório'});
-  }
-  final favs = _db.find('favorites', where: (r) => r['email'] == email);
-  return _json(200, {'favorites': favs});
+  if (email == null || email.isEmpty) return _json(400, {'message': 'E-mail obrigatório'});
+
+  final rows = await _db.execute(
+    Sql.named('SELECT * FROM favorites WHERE email = @email ORDER BY created_at DESC'),
+    parameters: {'email': email},
+  );
+  return _json(200, {'favorites': rows.map(_rowToMap).toList()});
 }
 
 Future<Response> _addFavorite(Request req) async {
   final b = await _parseBody(req);
   if (b == null) return _json(400, {'message': 'JSON inválido'});
 
-  final email     = (b['email']      as String?)?.trim().toLowerCase();
-  final productId = b['product_id']  as String?;
-  if (email == null || productId == null) {
-    return _json(400, {'message': 'Dados inválidos'});
-  }
-  if (_db.findOne('favorites',
-          where: (r) => r['email'] == email && r['product_id'] == productId) !=
-      null) {
-    return _json(200, {'message': 'Já está nos favoritos'});
-  }
+  final email     = (b['email']     as String?)?.trim().toLowerCase();
+  final productId = b['product_id'] as String?;
+  if (email == null || productId == null) return _json(400, {'message': 'Dados inválidos'});
 
-  final fav = _db.insert('favorites', {
-    'email': email,
-    'product_id': productId,
-    'product_name': b['product_name'] ?? '',
-    'price': b['price'],
-  });
-  return _json(201, {'favorite': fav});
+  await _db.execute(
+    Sql.named('''INSERT INTO favorites (email, product_id, product_name, price)
+        VALUES (@email, @pid, @name, @price)
+        ON CONFLICT (email, product_id) DO NOTHING'''),
+    parameters: {
+      'email': email,
+      'pid': productId,
+      'name': b['product_name'] ?? '',
+      'price': (b['price'] as num?)?.toDouble(),
+    },
+  );
+  return _json(201, {'message': 'Adicionado aos favoritos'});
 }
 
 Future<Response> _removeFavorite(Request req, String productId) async {
   final email = req.url.queryParameters['email'];
-  if (email == null || email.isEmpty) {
-    return _json(400, {'message': 'E-mail obrigatório'});
-  }
-  _db.delete('favorites',
-      where: (r) => r['email'] == email && r['product_id'] == productId);
+  if (email == null || email.isEmpty) return _json(400, {'message': 'E-mail obrigatório'});
+
+  await _db.execute(
+    Sql.named('DELETE FROM favorites WHERE email = @email AND product_id = @pid'),
+    parameters: {'email': email, 'pid': productId},
+  );
   return _json(200, {'message': 'Removido dos favoritos'});
 }
 
@@ -325,11 +478,13 @@ Future<Response> _removeFavorite(Request req, String productId) async {
 
 Future<Response> _getAlerts(Request req) async {
   final email = req.url.queryParameters['email'];
-  if (email == null || email.isEmpty) {
-    return _json(400, {'message': 'E-mail obrigatório'});
-  }
-  final alerts = _db.find('price_alerts', where: (r) => r['email'] == email);
-  return _json(200, {'alerts': alerts});
+  if (email == null || email.isEmpty) return _json(400, {'message': 'E-mail obrigatório'});
+
+  final rows = await _db.execute(
+    Sql.named('SELECT * FROM price_alerts WHERE email = @email ORDER BY created_at DESC'),
+    parameters: {'email': email},
+  );
+  return _json(200, {'alerts': rows.map(_rowToMap).toList()});
 }
 
 Future<Response> _createAlert(Request req) async {
@@ -339,26 +494,31 @@ Future<Response> _createAlert(Request req) async {
   final email       = (b['email']        as String?)?.trim().toLowerCase();
   final productId   = b['product_id']    as String?;
   final targetPrice = (b['target_price'] as num?)?.toDouble();
-
   if (email == null || productId == null || targetPrice == null) {
     return _json(400, {'message': 'Dados inválidos'});
   }
 
-  final alert = _db.insert('price_alerts', {
-    'email': email,
-    'product_id': productId,
-    'product_name': b['product_name'] ?? '',
-    'current_price': b['current_price'],
-    'target_price': targetPrice,
-    'active': true,
-  });
-  return _json(201, {'alert': alert});
+  final rows = await _db.execute(
+    Sql.named('''INSERT INTO price_alerts (email, product_id, product_name, current_price, target_price)
+        VALUES (@email, @pid, @name, @cur, @tgt) RETURNING *'''),
+    parameters: {
+      'email': email,
+      'pid': productId,
+      'name': b['product_name'] ?? '',
+      'cur': (b['current_price'] as num?)?.toDouble(),
+      'tgt': targetPrice,
+    },
+  );
+  return _json(201, {'alert': _rowToMap(rows.first)});
 }
 
 Future<Response> _deleteAlert(Request req, String id) async {
   final idInt = int.tryParse(id);
   if (idInt == null) return _json(400, {'message': 'ID inválido'});
-  _db.delete('price_alerts', where: (r) => r['id'] == idInt);
+  await _db.execute(
+    Sql.named('DELETE FROM price_alerts WHERE id = @id'),
+    parameters: {'id': idInt},
+  );
   return _json(200, {'message': 'Alerta removido'});
 }
 
@@ -366,15 +526,22 @@ Future<Response> _deleteAlert(Request req, String id) async {
 
 Future<Response> _getOrders(Request req) async {
   final email = req.url.queryParameters['email'];
-  if (email == null || email.isEmpty) {
-    return _json(400, {'message': 'E-mail obrigatório'});
+  if (email == null || email.isEmpty) return _json(400, {'message': 'E-mail obrigatório'});
+
+  final orders = await _db.execute(
+    Sql.named('SELECT * FROM orders WHERE email = @email ORDER BY created_at DESC'),
+    parameters: {'email': email},
+  );
+
+  final result = <Map<String, dynamic>>[];
+  for (final o in orders) {
+    final order = _rowToMap(o);
+    final items = await _db.execute(
+      Sql.named('SELECT * FROM order_items WHERE order_id = @oid'),
+      parameters: {'oid': order['id']},
+    );
+    result.add({...order, 'items': items.map(_rowToMap).toList()});
   }
-  final orders = _db.find('orders', where: (r) => r['email'] == email);
-  final result = orders.map((o) {
-    final items = _db.find('order_items',
-        where: (r) => r['order_id'] == o['id']);
-    return {...o, 'items': items};
-  }).toList();
   return _json(200, {'orders': result});
 }
 
@@ -385,38 +552,48 @@ Future<Response> _createOrder(Request req) async {
   final email = (b['email'] as String?)?.trim().toLowerCase();
   final items = b['items'] as List?;
   final total = (b['total'] as num?)?.toDouble();
-
   if (email == null || items == null || items.isEmpty || total == null) {
     return _json(400, {'message': 'Dados inválidos'});
   }
 
-  final order = _db.insert('orders', {
-    'email': email,
-    'total': total,
-    'status': 'pending',
-    'address_id': b['address_id'],
-    'payment_method': b['payment_method'] ?? 'credit_card',
-  });
+  final orderRows = await _db.execute(
+    Sql.named('''INSERT INTO orders (email, total, address_id, payment_method)
+        VALUES (@email, @total, @addr, @pay) RETURNING *'''),
+    parameters: {
+      'email': email,
+      'total': total,
+      'addr': b['address_id'],
+      'pay': b['payment_method'] ?? 'credit_card',
+    },
+  );
+  final order = _rowToMap(orderRows.first);
 
   for (final raw in items) {
     final item = raw as Map<String, dynamic>;
-    _db.insert('order_items', {
-      'order_id': order['id'],
-      'product_id': '${item['product_id']}',
-      'product_name': item['product_name'] ?? '',
-      'store': item['store'] ?? '',
-      'price': (item['price'] as num?)?.toDouble() ?? 0.0,
-      'quantity': (item['quantity'] as num?)?.toInt() ?? 1,
-    });
+    await _db.execute(
+      Sql.named('''INSERT INTO order_items (order_id, product_id, product_name, store, price, quantity)
+          VALUES (@oid, @pid, @name, @store, @price, @qty)'''),
+      parameters: {
+        'oid': order['id'],
+        'pid': '${item['product_id']}',
+        'name': item['product_name'] ?? '',
+        'store': item['store'] ?? '',
+        'price': (item['price'] as num?)?.toDouble() ?? 0.0,
+        'qty': (item['quantity'] as num?)?.toInt() ?? 1,
+      },
+    );
   }
 
-  _db.insert('notifications', {
-    'email': email,
-    'type': 'order',
-    'title': 'Pedido #${order['id']} confirmado!',
-    'body': 'Seu pedido de R\$ ${total.toStringAsFixed(2)} foi realizado com sucesso.',
-    'read': false,
-  });
+  await _db.execute(
+    Sql.named('''INSERT INTO notifications (email, type, title, body)
+        VALUES (@email, @type, @title, @body)'''),
+    parameters: {
+      'email': email,
+      'type': 'order',
+      'title': 'Pedido #${order['id']} confirmado!',
+      'body': 'Seu pedido de R\$ ${total.toStringAsFixed(2)} foi realizado com sucesso.',
+    },
+  );
 
   return _json(201, {'order': order});
 }
@@ -425,12 +602,13 @@ Future<Response> _createOrder(Request req) async {
 
 Future<Response> _getAddresses(Request req) async {
   final email = req.url.queryParameters['email'];
-  if (email == null || email.isEmpty) {
-    return _json(400, {'message': 'E-mail obrigatório'});
-  }
-  return _json(200, {
-    'addresses': _db.find('addresses', where: (r) => r['email'] == email),
-  });
+  if (email == null || email.isEmpty) return _json(400, {'message': 'E-mail obrigatório'});
+
+  final rows = await _db.execute(
+    Sql.named('SELECT * FROM addresses WHERE email = @email ORDER BY is_default DESC, created_at'),
+    parameters: {'email': email},
+  );
+  return _json(200, {'addresses': rows.map(_rowToMap).toList()});
 }
 
 Future<Response> _createAddress(Request req) async {
@@ -438,30 +616,35 @@ Future<Response> _createAddress(Request req) async {
   if (b == null) return _json(400, {'message': 'JSON inválido'});
 
   final email = (b['email'] as String?)?.trim().toLowerCase();
-  if (email == null || email.isEmpty) {
-    return _json(400, {'message': 'E-mail obrigatório'});
-  }
+  if (email == null || email.isEmpty) return _json(400, {'message': 'E-mail obrigatório'});
 
-  // Se for padrão, desmarcar os outros
   if (b['is_default'] == true) {
-    _db.update('addresses', {'is_default': false},
-        where: (r) => r['email'] == email);
+    await _db.execute(
+      Sql.named('UPDATE addresses SET is_default = FALSE WHERE email = @email'),
+      parameters: {'email': email},
+    );
   }
 
-  final addr = _db.insert('addresses', {
-    'email': email,
-    'label': b['label'] ?? 'Casa',
-    'recipient': b['recipient'] ?? '',
-    'street': b['street'] ?? '',
-    'number': b['number'] ?? '',
-    'complement': b['complement'] ?? '',
-    'neighborhood': b['neighborhood'] ?? '',
-    'city': b['city'] ?? '',
-    'state': b['state'] ?? '',
-    'zip_code': b['zip_code'] ?? '',
-    'is_default': b['is_default'] ?? false,
-  });
-  return _json(201, {'address': addr});
+  final rows = await _db.execute(
+    Sql.named('''INSERT INTO addresses
+        (email, label, recipient, street, number, complement, neighborhood, city, state, zip_code, is_default)
+        VALUES (@email, @label, @recip, @street, @num, @comp, @neigh, @city, @state, @zip, @def)
+        RETURNING *'''),
+    parameters: {
+      'email': email,
+      'label': b['label'] ?? 'Casa',
+      'recip': b['recipient'] ?? '',
+      'street': b['street'] ?? '',
+      'num': b['number'] ?? '',
+      'comp': b['complement'] ?? '',
+      'neigh': b['neighborhood'] ?? '',
+      'city': b['city'] ?? '',
+      'state': b['state'] ?? '',
+      'zip': b['zip_code'] ?? '',
+      'def': b['is_default'] ?? false,
+    },
+  );
+  return _json(201, {'address': _rowToMap(rows.first)});
 }
 
 Future<Response> _updateAddress(Request req, String id) async {
@@ -469,30 +652,54 @@ Future<Response> _updateAddress(Request req, String id) async {
   if (b == null) return _json(400, {'message': 'JSON inválido'});
   final idInt = int.tryParse(id);
   if (idInt == null) return _json(400, {'message': 'ID inválido'});
-  _db.update('addresses', b, where: (r) => r['id'] == idInt);
+
+  final fields = <String>[];
+  final params = <String, dynamic>{'id': idInt};
+  void set(String col, String key) {
+    if (b[key] != null) { fields.add('$col = @$key'); params[key] = b[key]; }
+  }
+  set('label', 'label'); set('recipient', 'recipient');
+  set('street', 'street'); set('number', 'number');
+  set('complement', 'complement'); set('neighborhood', 'neighborhood');
+  set('city', 'city'); set('state', 'state');
+  set('zip_code', 'zip_code'); set('is_default', 'is_default');
+
+  if (fields.isEmpty) return _json(200, {'message': 'Nada a atualizar'});
+  fields.add('updated_at = NOW()');
+
+  await _db.execute(
+    Sql.named('UPDATE addresses SET ${fields.join(', ')} WHERE id = @id'),
+    parameters: params,
+  );
   return _json(200, {'message': 'Endereço atualizado'});
 }
 
 Future<Response> _deleteAddress(Request req, String id) async {
   final idInt = int.tryParse(id);
   if (idInt == null) return _json(400, {'message': 'ID inválido'});
-  _db.delete('addresses', where: (r) => r['id'] == idInt);
+  await _db.execute(
+    Sql.named('DELETE FROM addresses WHERE id = @id'),
+    parameters: {'id': idInt},
+  );
   return _json(200, {'message': 'Endereço removido'});
 }
 
 // ── Avaliações ────────────────────────────────────────────────────────────────
 
 Future<Response> _getReviews(Request req, String productId) async {
-  final reviews = _db.find('reviews',
-      where: (r) => r['product_id'] == productId);
-  final avg = reviews.isEmpty
+  final rows = await _db.execute(
+    Sql.named('SELECT * FROM reviews WHERE product_id = @pid ORDER BY created_at DESC'),
+    parameters: {'pid': productId},
+  );
+  final list = rows.map(_rowToMap).toList();
+  final avg  = list.isEmpty
       ? 0.0
-      : reviews.map((r) => (r['rating'] as num).toDouble()).reduce((a, b) => a + b) /
-          reviews.length;
+      : list.map((r) => (r['rating'] as num).toDouble()).reduce((a, b) => a + b) /
+          list.length;
   return _json(200, {
-    'reviews': reviews,
+    'reviews': list,
     'average': double.parse(avg.toStringAsFixed(1)),
-    'count': reviews.length,
+    'count': list.length,
   });
 }
 
@@ -500,76 +707,51 @@ Future<Response> _createReview(Request req) async {
   final b = await _parseBody(req);
   if (b == null) return _json(400, {'message': 'JSON inválido'});
 
-  final email     = (b['email']      as String?)?.trim().toLowerCase();
-  final productId = b['product_id']  as String?;
-  final rating    = (b['rating']     as num?)?.toInt();
-
+  final email     = (b['email']     as String?)?.trim().toLowerCase();
+  final productId = b['product_id'] as String?;
+  final rating    = (b['rating']    as num?)?.toInt();
   if (email == null || productId == null || rating == null ||
       rating < 1 || rating > 5) {
     return _json(400, {'message': 'Dados inválidos (nota entre 1 e 5)'});
   }
 
-  // Uma avaliação por produto por usuário
-  _db.delete('reviews',
-      where: (r) => r['email'] == email && r['product_id'] == productId);
-
-  final review = _db.insert('reviews', {
-    'email': email,
-    'product_id': productId,
-    'rating': rating,
-    'comment': (b['comment'] as String?)?.trim() ?? '',
-  });
-  return _json(201, {'review': review});
+  final rows = await _db.execute(
+    Sql.named('''INSERT INTO reviews (email, product_id, rating, comment)
+        VALUES (@email, @pid, @rating, @comment)
+        ON CONFLICT (email, product_id) DO UPDATE
+          SET rating = EXCLUDED.rating, comment = EXCLUDED.comment
+        RETURNING *'''),
+    parameters: {
+      'email': email,
+      'pid': productId,
+      'rating': rating,
+      'comment': (b['comment'] as String?)?.trim() ?? '',
+    },
+  );
+  return _json(201, {'review': _rowToMap(rows.first)});
 }
 
 // ── Notificações ──────────────────────────────────────────────────────────────
 
 Future<Response> _getNotifications(Request req) async {
   final email = req.url.queryParameters['email'];
-  if (email == null || email.isEmpty) {
-    return _json(400, {'message': 'E-mail obrigatório'});
-  }
-  final notifs = _db.find('notifications',
-      where: (r) => r['email'] == email)
-    ..sort((a, b) =>
-        (b['created_at'] as String).compareTo(a['created_at'] as String));
-  return _json(200, {'notifications': notifs});
+  if (email == null || email.isEmpty) return _json(400, {'message': 'E-mail obrigatório'});
+
+  final rows = await _db.execute(
+    Sql.named('SELECT * FROM notifications WHERE email = @email ORDER BY created_at DESC'),
+    parameters: {'email': email},
+  );
+  return _json(200, {'notifications': rows.map(_rowToMap).toList()});
 }
 
 Future<Response> _markRead(Request req, String id) async {
   final idInt = int.tryParse(id);
   if (idInt == null) return _json(400, {'message': 'ID inválido'});
-  _db.update('notifications', {'read': true},
-      where: (r) => r['id'] == idInt);
+  await _db.execute(
+    Sql.named('UPDATE notifications SET read = TRUE WHERE id = @id'),
+    parameters: {'id': idInt},
+  );
   return _json(200, {'message': 'Notificação marcada como lida'});
-}
-
-// ── Perfil do usuário ─────────────────────────────────────────────────────────
-
-Future<Response> _getProfile(Request req) async {
-  final email = req.url.queryParameters['email'];
-  if (email == null || email.isEmpty) {
-    return _json(400, {'message': 'E-mail obrigatório'});
-  }
-  final user = _db.findOne('users', where: (r) => r['email'] == email);
-  if (user == null) return _json(404, {'message': 'Usuário não encontrado'});
-  final safe = Map<String, dynamic>.from(user)..remove('password_hash');
-  return _json(200, {'user': safe});
-}
-
-Future<Response> _updateProfile(Request req) async {
-  final b = await _parseBody(req);
-  if (b == null) return _json(400, {'message': 'JSON inválido'});
-  final email = (b['email'] as String?)?.trim().toLowerCase();
-  if (email == null || email.isEmpty) {
-    return _json(400, {'message': 'E-mail obrigatório'});
-  }
-  final allowed = <String, dynamic>{};
-  if (b['name'] != null) allowed['name'] = (b['name'] as String).trim();
-  if (b['phone'] != null) allowed['phone'] = b['phone'];
-  if (b['avatar_url'] != null) allowed['avatar_url'] = b['avatar_url'];
-  _db.update('users', allowed, where: (r) => r['email'] == email);
-  return _json(200, {'message': 'Perfil atualizado'});
 }
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
@@ -590,6 +772,8 @@ Middleware _cors() {
 // ── main ──────────────────────────────────────────────────────────────────────
 
 void main() async {
+  await _initDb();
+
   final router = Router()
     ..get('/',       (_) => _json(200, {'status': 'ok', 'service': 'OlysTech API'}))
     ..get('/health', (_) => _json(200, {'status': 'ok'}))
@@ -603,42 +787,31 @@ void main() async {
     ..get('/profile',          _getProfile)
     ..put('/profile',          _updateProfile)
     // ── Favoritos
-    ..get('/favorites',                _getFavorites)
-    ..post('/favorites',               _addFavorite)
-    ..delete('/favorites/<id>',        _removeFavorite)
+    ..get('/favorites',               _getFavorites)
+    ..post('/favorites',              _addFavorite)
+    ..delete('/favorites/<id>',       _removeFavorite)
     // ── Alertas de preço
-    ..get('/price-alerts',             _getAlerts)
-    ..post('/price-alerts',            _createAlert)
-    ..delete('/price-alerts/<id>',     _deleteAlert)
+    ..get('/price-alerts',            _getAlerts)
+    ..post('/price-alerts',           _createAlert)
+    ..delete('/price-alerts/<id>',    _deleteAlert)
     // ── Pedidos
-    ..get('/orders',                   _getOrders)
-    ..post('/orders',                  _createOrder)
+    ..get('/orders',                  _getOrders)
+    ..post('/orders',                 _createOrder)
     // ── Endereços
-    ..get('/addresses',                _getAddresses)
-    ..post('/addresses',               _createAddress)
-    ..put('/addresses/<id>',           _updateAddress)
-    ..delete('/addresses/<id>',        _deleteAddress)
+    ..get('/addresses',               _getAddresses)
+    ..post('/addresses',              _createAddress)
+    ..put('/addresses/<id>',          _updateAddress)
+    ..delete('/addresses/<id>',       _deleteAddress)
     // ── Avaliações
-    ..get('/products/<id>/reviews',    _getReviews)
-    ..post('/reviews',                 _createReview)
+    ..get('/products/<id>/reviews',   _getReviews)
+    ..post('/reviews',                _createReview)
     // ── Notificações
-    ..get('/notifications',            _getNotifications)
-    ..put('/notifications/<id>/read',  _markRead);
+    ..get('/notifications',           _getNotifications)
+    ..put('/notifications/<id>/read', _markRead);
 
   final port    = int.parse(Platform.environment['PORT'] ?? '8090');
   final handler = Pipeline().addMiddleware(_cors()).addHandler(router.call);
   final server  = await serve(handler, InternetAddress.anyIPv4, port);
 
-  stderr.writeln('');
-  stderr.writeln('╔══════════════════════════════════════════╗');
-  stderr.writeln('║  OlysTech Backend  •  porta ${server.port}         ║');
-  stderr.writeln('╚══════════════════════════════════════════╝');
-  stderr.writeln('Dados persistidos em: ${Directory('data').absolute.path}');
-  stderr.writeln('');
-  stderr.writeln('Tabelas (arquivos JSON):');
-  stderr.writeln('  users · sessions · reset_tokens');
-  stderr.writeln('  favorites · price_alerts');
-  stderr.writeln('  orders · order_items');
-  stderr.writeln('  addresses · reviews · notifications');
-  stderr.writeln('');
+  stderr.writeln('OlysTech Backend rodando na porta ${server.port}');
 }
