@@ -12,11 +12,20 @@ import 'package:postgres/postgres.dart';
 late Connection _db;
 
 Future<void> _initDb() async {
-  final url = Platform.environment['DATABASE_URL'];
-  if (url == null) throw Exception('DATABASE_URL não definido');
+  final rawUrl = Platform.environment['DATABASE_URL'];
+  if (rawUrl == null) throw Exception('DATABASE_URL não definido');
+
+  final uri      = Uri.parse(rawUrl);
+  final userParts = uri.userInfo.split(':');
 
   _db = await Connection.open(
-    Endpoint.parse(url),
+    Endpoint(
+      host: uri.host,
+      port: uri.hasPort ? uri.port : 5432,
+      database: uri.pathSegments.isNotEmpty ? uri.pathSegments.first : 'postgres',
+      username: userParts.isNotEmpty ? userParts[0] : null,
+      password: userParts.length > 1 ? userParts[1] : null,
+    ),
     settings: ConnectionSettings(sslMode: SslMode.require),
   );
 
@@ -171,14 +180,13 @@ Future<Map<String, dynamic>?> _parseBody(Request req) async {
 }
 
 Map<String, dynamic> _rowToMap(ResultRow row) {
-  final map = <String, dynamic>{};
-  for (final col in row.schema.columns) {
-    final val = row[col.columnName];
-    if (val is DateTime) {
-      map[col.columnName!] = val.toUtc().toIso8601String();
-    } else {
-      map[col.columnName!] = val;
-    }
+  final map  = <String, dynamic>{};
+  final cols = row.schema.columns;
+  var i = 0;
+  for (final val in row) {
+    final name = cols[i].columnName ?? 'col_$i';
+    map[name] = val is DateTime ? val.toUtc().toIso8601String() : val;
+    i++;
   }
   return map;
 }
